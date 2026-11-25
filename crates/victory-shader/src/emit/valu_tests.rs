@@ -338,6 +338,88 @@ fn v_fma_legacy_f32_follows_the_d3d9_zero_rule() {
     });
 }
 
+/// The two RDNA2 legacy multiply-adds: VOP3 0x140 (`v_fma_legacy_f32 v0, v1,
+/// v2, v3`) and VOP2 0x006 (`v_fmac_legacy_f32 v0, v1, v2` with `v0 = v3`).
+fn fma_legacy_shaders() -> [(&'static str, HostShader); 2] {
+    // VOP2 `op vdst, src0, vsrc1`.
+    const fn vop2(op: u8, vdst: u8, src0: u16, vsrc1: u8) -> u32 {
+        (op as u32 & 0x3F) << 25 | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | (src0 as u32 & 0x1FF)
+    }
+    [
+        (
+            "vop3 0x140",
+            build_valu_cs(&vop3(0x140, 0, vgpr(1), vgpr(2), vgpr(3))),
+        ),
+        (
+            "vop2 0x006",
+            build_valu_cs(&[vop1(0x001, 0, vgpr(3)), vop2(0x006, 0, vgpr(1), 2)]),
+        ),
+    ]
+}
+
+/// Runs `cases` (`[a, b, c]` → result bits) through both legacy multiply-adds
+/// on the backends `on` accepts, and fails with every mismatching row.
+/// Returns how many rows ran.
+fn check_fma_legacy(cases: &[([u32; 3], u32)], on: impl Fn(&str) -> bool) -> usize {
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| [c.0[0], c.0[1], c.0[2], 0]).collect();
+    let mut ran = 0;
+    let mut bad = Vec::new();
+    for (op, shader) in fma_legacy_shaders() {
+        run_cases(&shader, &inputs, |backend, i, inp, got| {
+            if !on(backend) {
+                return;
+            }
+            ran += 1;
+            let want = cases[i].1;
+            let row = format!(
+                "{backend} {op}: ({:#010x}, {:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+                inp[0], inp[1], inp[2]
+            );
+            eprintln!("{row}");
+            if got != want {
+                bad.push(row);
+            }
+        });
+    }
+    assert!(bad.is_empty(), "mismatches:\n{}", bad.join("\n"));
+    ran
+}
+
+#[test]
+fn v_fma_legacy_f32_rounds_once_on_hardware() {
+    // a·b + c rounded once; a separately rounded product gives 0. Measured on
+    // RDNA2 (gfx1036) for both opcodes:
+    // https://github.com/Marvisak/VIctory/pull/284#issuecomment-7123407986
+    // and the second row on gfx1036 and an RX 9070:
+    // https://github.com/Marvisak/VIctory/pull/284#issuecomment-7125151879
+    // shortcut: the lowering's FMad is fused by hardware drivers but not by
+    // WARP, so the rows are checked on the hardware backend only.
+    let cases = [
+        ([0x3F80_0001, 0x3F80_0001, 0xBF80_0002], 0x2880_0000),
+        ([0x3F80_0800, 0x3F80_0800, 0xBF80_1000], 0x3380_0000),
+    ];
+    if check_fma_legacy(&cases, |backend| backend == "hardware") == 0 {
+        eprintln!("SKIPPED: no hardware SM 6.6 device");
+    }
+}
+
+#[test]
+fn v_fma_legacy_f32_flushes_denormals() {
+    // Inputs and result flushed whatever the FP32 denormal mode; RDNA2
+    // (gfx1036) with denormals kept (mode 3), where `v_fma_f32` gives
+    // 0x00000100, 0x00000200 and 0x00400000 for these rows:
+    // https://github.com/Marvisak/VIctory/pull/284#issuecomment-7124493786
+    // A host that flushes f32 denormals itself (NVIDIA and WARP do) passes
+    // these whether or not the lowering flushes; one that keeps them does not.
+    let f = f32::to_bits;
+    let cases = [
+        ([0, f(3.0), 0x0000_0100], 0),
+        ([0x0000_0100, f(2.0), 0], 0),
+        ([f(2f32.powi(-63)), f(2f32.powi(-64)), 0], 0),
+    ];
+    check_fma_legacy(&cases, |_| true);
+}
+
 #[test]
 fn v_fract_f32_never_returns_one() {
     // v_fract_f32 v0, v1 (VOP1 opcode 0x020)
