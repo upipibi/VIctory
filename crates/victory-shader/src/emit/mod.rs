@@ -1679,7 +1679,7 @@ mod tests {
             ],
             io: crate::native::StageIo::Cs(crate::native::ComputeIo {
                 rsrc2: 5 << 1,
-                threads: [10, 1, 1],
+                threads: [13, 1, 1],
             }),
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
@@ -1727,8 +1727,8 @@ mod tests {
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let inputs: Vec<u32> = [
-                7.0f32, 3.0, -1.0, 1e-40, 1.0, 1e35, 1e-35, 1e-36, 0.0, 0.0, -1.0, 0.0, -1e35, 1e35,
-                1e30, 1e38, 1e-40, 2e-40, 2e-34, 4.0,
+                7.0f32, 3.0, -1.0, 1e-40, 1.0, 1e35, 1e-35, 1e-36, 0.0, 0.0, -1.0, 0.0, -1e35,
+                1e35, 1e30, 1e38, 1e-40, 2e-40, 2e-34, 4.0, 1e30, 1e-5, 1e-20, 1e20, 0.1, 1e38,
             ]
             .into_iter()
             .map(f32::to_bits)
@@ -1751,7 +1751,29 @@ mod tests {
                     },
                 )
                 .unwrap();
-            let got: Vec<f32> = out[0][..10].iter().copied().map(f32::from_bits).collect();
+            let got: Vec<f32> = out[0][..13].iter().copied().map(f32::from_bits).collect();
+            // Lanes 10-12 take v_div_scale_f32's scaled paths with VCC = 1, so
+            // v_div_fmas_f32 has to undo the scale: 1e30 / 1e-5 (exponent
+            // difference >= 96: denominator scaled), 1e-20 / 1e20 (S2/S1
+            // denormal: numerator scaled) and 0.1 / 1e38 (1/S1 and S2/S1
+            // denormal). The last two quotients are f32 denormals, so a
+            // flushed +0 is accepted as well as the denormal.
+            let mut bad = Vec::new();
+            for (lane, want) in [(10, 1e35f32), (11, 1e-40), (12, 1e-39)] {
+                let ok = if want.is_normal() {
+                    (got[lane] / want - 1.0).abs() < 1e-6
+                } else {
+                    out[0][lane] == 0 || (got[lane] - want).abs() <= 2e-45
+                };
+                eprintln!(
+                    "lane {lane}: {:e} ({:#010x}), want {want:e}",
+                    got[lane], out[0][lane]
+                );
+                if !ok {
+                    bad.push(lane);
+                }
+            }
+            assert!(bad.is_empty(), "lanes {bad:?} wrong: {got:?}");
             assert!((got[0] - (7.0f32 / 3.0)).abs() < 1e-6, "got {:?}", got);
             assert_eq!(out[0][1], (-1.0f32 / 1e-40).to_bits());
             assert!(
