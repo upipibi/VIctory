@@ -1024,3 +1024,192 @@ fn pixel_quad_swizzle_and_dpp_validate_and_create_pipeline() {
             .unwrap_or_else(|e| panic!("{label}: graphics pipeline creation failed: {e}"));
     }
 }
+
+// ---- probe for PR #2176 (constant 64-bit EXEC on a 32-lane host) ----
+
+const fn s_mov_b64(sdst: u8, src0: u8) -> u32 {
+    0xBE80_0000 | (sdst as u32) << 16 | 0x04 << 8 | src0 as u32
+}
+
+/// 64-thread wave64 CS: out[tid] = 0xFFFFFFFF; save exec; `set_exec`;
+/// out[tid] = tid (active lanes only); restore exec.
+fn probe_exec_words(set_exec: &[u32]) -> Vec<u32> {
+    let mut w = Vec::new();
+    w.push(s_mov_b32(1, 0x80)); // s1 = 0
+    w.extend_from_slice(&s_load_dwordx4(4, 0)); // s[4:7]
+    w.push(v_lshlrev_b32_imm(5, 2, 0)); // v5 = tid * 4
+    w.push(0x7E00_0000 | 2 << 17 | 1 << 9 | 0xC1); // v_mov_b32 v2, -1
+    w.extend_from_slice(&buffer_store_dword_offen(2, 5, 4));
+    w.push(s_mov_b64(12, 0x7E)); // s[12:13] = exec
+    w.extend_from_slice(set_exec);
+    w.extend_from_slice(&buffer_store_dword_offen(0, 5, 4)); // out[tid] = tid
+    w.push(s_mov_b64(0x7E, 12)); // exec = s[12:13]
+    w.push(S_ENDPGM);
+    w
+}
+
+fn probe_build(words: &[u32], host_wave32: bool) -> Result<HostShader, String> {
+    let code: Vec<u8> = words.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: true,
+        vgprs: 8,
+        layout: vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 1 << 1,
+            threads: [64, 1, 1],
+        }),
+        code,
+    };
+    let e = |s: &str, x: &dyn std::fmt::Display| format!("{s}: {x}");
+    let p = ir::build(&native.code, native.wave64, native.vgprs).map_err(|x| e("ir", &x))?;
+    let st = structure::structure(&p).map_err(|x| e("structure", &x))?;
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st))
+        .map_err(|x| e("resource", &x))?;
+    let io = io::raise(&p, &native).map_err(|x| e("io", &x))?;
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        view_marks: false,
+        host_wave32,
+    })
+    .map_err(|x| e("lower", &x))?;
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        memory: lowered.memory,
+        memory_writes: lowered.memory_writes,
+        view_addresses: lowered.view_addresses,
+        heap: lowered.heap,
+        heap_writes: lowered.heap_writes,
+        view_marks: lowered.view_marks,
+    };
+    match validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        Ok(mut v) => {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy).map_err(|x| e("dxil validation", &x))?;
+        }
+        Err(_) => eprintln!("no dxil.dll; validation skipped"),
+    }
+    Ok(shader)
+}
+
+fn probe_dispatch(shader: &HostShader, warp: bool) -> Result<(String, Vec<u32>), String> {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let host = Host::new(warp)?;
+    let info = if warp {
+        "WARP".to_string()
+    } else {
+        wave32_hardware_info(&host).unwrap_or_else(|| "hw (no info)".into())
+    };
+    let (root, pso) = host
+        .compute_pipeline(shader)
+        .map_err(|x| format!("compute_pipeline on {info}: {x}"))?;
+    let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(64)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .map_err(|x| format!("dispatch on {info}: {x}"))?;
+    Ok((info, out[0][..64].to_vec()))
+}
+
+#[test]
+#[ignore = "local probe for PR #2176"]
+fn probe_2176_constant_exec64_on_wave32_host() {
+    let variants: Vec<(&str, Vec<u32>)> = vec![
+        // inline constant 1 -> Atom::Constant(1)
+        ("A exec=1 (s_mov_b64 exec, 1)", vec![s_mov_b64(0x7E, 0x81)]),
+        // register pairs (constants written by s_mov_b32)
+        (
+            "B exec=1<<32 (s14=0,s15=1; s_mov_b64 exec, s[14:15])",
+            vec![s_mov_b32(14, 0x80), s_mov_b32(15, 0x81), s_mov_b64(0x7E, 14)],
+        ),
+        (
+            "C exec=0x1_00000001 (s14=1,s15=1; s_mov_b64 exec, s[14:15])",
+            vec![s_mov_b32(14, 0x81), s_mov_b32(15, 0x81), s_mov_b64(0x7E, 14)],
+        ),
+        (
+            "D exec=1 (s14=1,s15=0; s_mov_b64 exec, s[14:15])",
+            vec![s_mov_b32(14, 0x81), s_mov_b32(15, 0x80), s_mov_b64(0x7E, 14)],
+        ),
+        (
+            "E exec=1<<32 (s_mov_b32 exec_lo, 0; s_mov_b32 exec_hi, 1)",
+            vec![s_mov_b32(0x7E, 0x80), s_mov_b32(0x7F, 0x81)],
+        ),
+    ];
+    let backends: Vec<bool> = match std::env::var("PROBE_BACKENDS").as_deref() {
+        Ok("hw") => vec![false],
+        Ok("warp") => vec![true],
+        _ => vec![false, true],
+    };
+    for (label, set_exec) in &variants {
+        let words = probe_exec_words(set_exec);
+        for hw32 in [true, false] {
+            for &warp in &backends {
+                let be = if warp { "WARP" } else { "HW" };
+                let head = format!("[PROBE] {label} | host_wave32={hw32} | {be}");
+                let shader = match probe_build(&words, hw32) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("{head} | REFUSED: {e}");
+                        continue;
+                    }
+                };
+                match probe_dispatch(&shader, warp) {
+                    Ok((info, out)) => {
+                        let stored: Vec<String> = out
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, v)| **v != 0xFFFF_FFFF)
+                            .map(|(i, v)| format!("out[{i}]={v}"))
+                            .collect();
+                        eprintln!("{head} | {info} | stored: [{}]", stored.join(", "));
+                        let all: Vec<String> = out.iter().map(|v| format!("{v:08x}")).collect();
+                        eprintln!("{head} | words: {}", all.join(" "));
+                    }
+                    Err(e) => eprintln!("{head} | RUN ERROR: {e}"),
+                }
+            }
+        }
+    }
+}
